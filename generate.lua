@@ -1,7 +1,10 @@
 require 'image'
 require 'nn'
+require 'cutorch'
+require 'cudnn'
 local optnet = require 'optnet'
 torch.setdefaulttensortype('torch.FloatTensor')
+
 
 opt = {
     batchSize = 32,        -- number of samples to produce
@@ -14,6 +17,7 @@ opt = {
     display = 1,           -- Display image: 0 = false, 1 = true
     nz = 100,              
 }
+
 for k,v in pairs(opt) do opt[k] = tonumber(os.getenv(k)) or os.getenv(k) or opt[k] end
 print(opt)
 if opt.display == 0 then opt.display = false end
@@ -24,12 +28,10 @@ noise = torch.Tensor(opt.batchSize, opt.nz, opt.imsize, opt.imsize)
 net = torch.load(opt.net)
 
 -- for older models, there was nn.View on the top
--- which is unnecessary, and hinders convolutional generations.
+-- which is unnecessary, and hin[1]ders convolutional generations.
 if torch.type(net:get(1)) == 'nn.View' then
     net:remove(1)
 end
-
-print(net)
 
 if opt.noisetype == 'uniform' then
     noise:uniform(-1, 1)
@@ -90,6 +92,7 @@ print('Saved image to: ', opt.name .. '.png')
 
 if opt.display then
     disp = require 'display'
+    disp.configure({hostname='127.0.0.1', port=9000})
     disp.image(images)
     print('Displayed image')
 end

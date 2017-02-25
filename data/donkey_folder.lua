@@ -17,7 +17,7 @@ paths.dofile('dataset.lua')
 -- Check for existence of opt.data
 opt.data = os.getenv('DATA_ROOT') or '/data/local/imagenet-fetch/256'
 if not paths.dirp(opt.data) then
-    error('Did not find directory: ', opt.data)
+    error('Did not find directory: ' .. opt.data)
 end
 
 -- a cache file of the training metadata (if doesnt exist, will be created)
@@ -55,6 +55,7 @@ local trainHook = function(self, path)
    local iW = input:size(3)
    local iH = input:size(2)
 
+   
    -- do random crop
    local oW = sampleSize[2];
    local oH = sampleSize[2]
@@ -63,7 +64,10 @@ local trainHook = function(self, path)
    local out = image.crop(input, w1, h1, w1 + oW, h1 + oH)
    assert(out:size(2) == oW)
    assert(out:size(3) == oH)
+
+
    -- do hflip with probability 0.5
+
    if torch.uniform() > 0.5 then out = image.hflip(out); end
    out:mul(2):add(-1) -- make it [0, 1] -> [-1, 1]
    return out

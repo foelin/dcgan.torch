@@ -32,12 +32,8 @@ if not os.execute('cd ' .. opt.data) then
 end
 
 trainPath = paths.concat(opt.data, 'train')
-valPath   = paths.concat(opt.data, 'val')
 
 -----------------------------------------------------------------------------------------
-if not os.execute('cd ' .. opt.data) then
-    error(("could not chdir to '%s'"):format(opt.data))
-end
 
 local loadSize   = {3, opt.loadSize}
 local sampleSize = {3, opt.fineSize}
