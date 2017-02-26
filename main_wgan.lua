@@ -20,14 +20,16 @@ opt = {
    display_id = 10,        -- display window id.
    port = 8000,
    gpu = 1,                -- gpu = 0 is CPU mode. gpu=X is GPU mode on GPU X
-   name = 'experiment1',
+   name = 'wgan',
    noise = 'normal',       -- uniform / normal
+   resultPath = 'result',
    dIter = 5,
    clampThre = 0.01
 }
 
 -- one-line argument parser. parses enviroment variables to override the defaults
 for k,v in pairs(opt) do opt[k] = tonumber(os.getenv(k)) or os.getenv(k) or opt[k] end
+opt.resultPath = paths.concat(opt.resultPath, opt.name)
 print(opt)
 if opt.display == 0 then opt.display = false end
 
@@ -144,7 +146,9 @@ if opt.display then
   disp.configure({hostname='127.0.0.1', port=opt.port})
 end
 
-local trainEpochLogger = optim.Logger(paths.concat('checkpoints', 'train_epoch.log'))
+paths.mkdir(opt.resultPath)
+local trainIterLogger = optim.Logger(paths.concat(opt.resultPath, 'train_iter.log'))
+local loss_iter = {netD={}, netG={}}
 
 noise_vis = noise:clone()
 if opt.noise == 'uniform' then
@@ -211,6 +215,7 @@ local fGx = function(x)
 end
 
 local gTotalCount = 0
+local dTotalCount = 0
 
 -- train
 for epoch = 1, opt.niter do
@@ -221,8 +226,6 @@ for epoch = 1, opt.niter do
 
    local dIter
 
-   local epoch_err_G = 0
-   local epoch_err_D = 0
    for i = 1, math.min(data:size(), opt.ntrain), opt.batchSize do
       tm:reset()
 
@@ -239,23 +242,32 @@ for epoch = 1, opt.niter do
         optim.rmsprop(fDx, parametersD, optimStateD)
         dTempCount = dTempCount + 1
         dCount = dCount + 1
+        dTotalCount = dTotalCount + 1
+        table.insert(loss_iter.netD, {dTotalCount, errD})
+
       else
         optim.rmsprop(fGx, parametersG, optimStateG)
         dTempCount = 0
         gCount = gCount + 1
         gTotalCount = gTotalCount + 1
-
+        table.insert(loss_iter.netG, {gTotalCount, errG})
         -- display
         if gTotalCount % 10 == 0  and opt.display then
           local fake = netG:forward(noise_vis)
           local real = data:getBatch()
           disp.image(fake, {win=opt.display_id, title=opt.name})
           disp.image(real, {win=opt.display_id * 3, title=opt.name})
+
+          disp.plot(loss_iter.netD, {win=15,title = "errD"})
+          disp.plot(loss_iter.netG, {win=14,title = "errG"})
         end
 
       end
 
-      
+      trainIterLogger:add{
+        ['netG loss'] = errG,
+        ['netD loss'] = errD,
+      }
 
       -- logging
       if ((i-1) / opt.batchSize) % 1 == 0 then
@@ -269,21 +281,13 @@ for epoch = 1, opt.niter do
 
       end
 
-      epoch_err_D = epoch_err_D + errD
-      epoch_err_G = epoch_err_G + errG
-
    end
 
-   trainEpochLogger:add{
-    ['Err_G'] = epoch_err_G/gCount,
-    ['Err_D'] = epoch_err_D/dCount,
-   }
-
-   paths.mkdir('checkpoints')
+  
    parametersD, gradParametersD = nil, nil -- nil them to avoid spiking memory
    parametersG, gradParametersG = nil, nil
-   --torch.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_G.t7', netG:clearState())
-   --torch.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_D.t7', netD:clearState())
+   --torch.save(paths.concat(paths.resultPath, epoch .. '_net_G.t7'), netG:clearState())
+   --torch.save(paths.concat(paths.resultPath, epoch .. '_net_D.t7'), netD:clearState())
    parametersD, gradParametersD = netD:getParameters() -- reflatten the params and get them
    parametersG, gradParametersG = netG:getParameters()
    print(('End of epoch %d / %d \t Time Taken: %.3f'):format(

@@ -1,5 +1,6 @@
 require 'torch'
 require 'nn'
+require 'cunn'
 require 'optim'
 
 opt = {
@@ -15,16 +16,19 @@ opt = {
    lr = 0.0002,            -- initial learning rate for adam
    beta1 = 0.5,            -- momentum term of adam
    ntrain = math.huge,     -- #  of examples per epoch. math.huge for full dataset
-   display = 0,            -- display samples while training. 0 = false
+   display = 1,            -- display samples while training. 0 = false
    display_id = 10,        -- display window id.
-   port = 8000,
    gpu = 1,                -- gpu = 0 is CPU mode. gpu=X is GPU mode on GPU X
-   name = 'experiment1',
+   name = 'gan',
    noise = 'normal',       -- uniform / normal
+   resultPath = 'result',
+   trainType = 1,
+   port = 9000
 }
 
 -- one-line argument parser. parses enviroment variables to override the defaults
 for k,v in pairs(opt) do opt[k] = tonumber(os.getenv(k)) or os.getenv(k) or opt[k] end
+opt.resultPath = paths.concat(opt.resultPath, opt.name)
 print(opt)
 if opt.display == 0 then opt.display = false end
 
@@ -114,28 +118,28 @@ optimStateD = {
    learningRate = opt.lr,
    beta1 = opt.beta1,
 }
+
+cutorch.setDevice(opt.gpu)
+
 ----------------------------------------------------------------------------
-local input = torch.Tensor(opt.batchSize, 3, opt.fineSize, opt.fineSize)
-local noise = torch.Tensor(opt.batchSize, nz, 1, 1)
-local label = torch.Tensor(opt.batchSize)
-local errD, errG
+local input = torch.CudaTensor(opt.batchSize, 3, opt.fineSize, opt.fineSize)
+local noise = torch.CudaTensor(opt.batchSize, nz, 1, 1)
+local label = torch.CudaTensor(opt.batchSize)
 local epoch_tm = torch.Timer()
 local tm = torch.Timer()
 local data_tm = torch.Timer()
 ----------------------------------------------------------------------------
-if opt.gpu > 0 then
-   require 'cunn'
-   cutorch.setDevice(opt.gpu)
-   input = input:cuda();  noise = noise:cuda();  label = label:cuda()
 
-   if pcall(require, 'cudnn') then
-      require 'cudnn'
-      cudnn.benchmark = true
-cudnn.convert(netG, cudnn)
-      cudnn.convert(netD, cudnn)
-   end
-   netD:cuda();           netG:cuda();           criterion:cuda()
+if pcall(require, 'cudnn') then
+  require 'cudnn'
+  cudnn.benchmark = true
+  cudnn.convert(netG, cudnn)
+  cudnn.convert(netD, cudnn)
 end
+
+netD:cuda();
+netG:cuda();           
+criterion:cuda()
 
 local parametersD, gradParametersD = netD:getParameters()
 local parametersG, gradParametersG = netG:getParameters()
@@ -145,7 +149,6 @@ if opt.display then
   disp.configure({hostname='127.0.0.1', port=opt.port})
 end
 
-local trainEpochLogger = optim.Logger(paths.concat('checkpoints', 'train_epoch.log'))
 
 noise_vis = noise:clone()
 if opt.noise == 'uniform' then
@@ -154,19 +157,26 @@ elseif opt.noise == 'normal' then
     noise_vis:normal(0, 1)
 end
 
+paths.mkdir(opt.resultPath)
+
+local trainIterLogger = optim.Logger(paths.concat(opt.resultPath, 'train_iter.log'))
+local loss_iter = {netD={}, netG={}}
+local errD = 0
+local errG = 0
+last_acc = 0
 -- create closure to evaluate f(X) and df/dX of discriminator
 local fDx = function(x)
    gradParametersD:zero()
 
    -- train with real
    data_tm:reset(); data_tm:resume()
---   local real = data:getBatch()
-   local real = torch.rand(opt.batchSize, 3, opt.fineSize, opt.fineSize)
+   local real = data:getBatch()
    data_tm:stop()
    input:copy(real)
    label:fill(real_label)
 
    local output = netD:forward(input)
+   local real_pred = output:float():clone()
    local errD_real = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
@@ -182,13 +192,72 @@ local fDx = function(x)
    label:fill(fake_label)
 
    local output = netD:forward(input)
+   local fake_pred = output:float():clone()
    local errD_fake = criterion:forward(output, label)
    local df_do = criterion:backward(output, label)
    netD:backward(input, df_do)
 
-   errD = errD_real + errD_fake
+   errD = (errD_real + errD_fake)/2
+
+   -- top-1 acc
+    local real_correct = real_pred:gt(0.5):sum()
+    local fake_correct = fake_pred:le(0.5):sum()
+    local acc = (real_correct+fake_correct)/opt.batchSize/2
+    last_acc = acc
+    
+    print(string.format("real: %.3f, %.3f, %.3f", real_pred:max(), real_pred:min(), real_pred:mean()))
+    --print(real_pred:view(1, opt.batchSize))
+    print(string.format("fake: %.3f, %.3f, %.3f", fake_pred:max(), fake_pred:min(), fake_pred:mean()))
+    --print(fake_pred:view(1, opt.batchSize))
+    print(string.format('real: %d/%d, fake: %d/%d, acc=%.2f', real_correct, opt.batchSize, fake_correct, opt.batchSize, acc))
 
    return errD, gradParametersD
+end
+
+
+
+local forwardD = function()
+   
+   -- train with real
+   data_tm:reset(); data_tm:resume()
+   local real = data:getBatch()
+   data_tm:stop()
+   input:copy(real)
+   label:fill(real_label)
+
+   local output = netD:forward(input)
+   local real_pred = output:float():clone()
+   local errD_real = criterion:forward(output, label)
+   
+   -- train with fake
+   if opt.noise == 'uniform' then -- regenerate random noise
+       noise:uniform(-1, 1)
+   elseif opt.noise == 'normal' then
+       noise:normal(0, 1)
+   end
+   local fake = netG:forward(noise)
+   input:copy(fake)
+   label:fill(fake_label)
+
+   local output = netD:forward(input)
+   local fake_pred = output:float():clone()
+   local errD_fake = criterion:forward(output, label)
+
+   errD = (errD_real + errD_fake)/2
+
+   -- top-1 acc
+    local real_correct = real_pred:gt(0.5):sum()
+    local fake_correct = fake_pred:le(0.5):sum()
+    local acc = (real_correct+fake_correct)/opt.batchSize/2
+    last_acc = acc
+    
+    print(string.format("real: %.3f, %.3f, %.3f", real_pred:max(), real_pred:min(), real_pred:mean()))
+    --print(real_pred:view(1, opt.batchSize))
+    print(string.format("fake: %.3f, %.3f, %.3f", fake_pred:max(), fake_pred:min(), fake_pred:mean()))
+    --print(fake_pred:view(1, opt.batchSize))
+    print(string.format('real: %d/%d, fake: %d/%d, acc=%.2f', real_correct, opt.batchSize, fake_correct, opt.batchSize, acc))
+
+    return errD
 end
 
 -- create closure to evaluate f(X) and df/dX of generator
@@ -210,19 +279,50 @@ local fGx = function(x)
    return errG, gradParametersG
 end
 
+local dCount=0
+local gCount=0
+
 -- train
+local iter_num = 0
 for epoch = 1, opt.niter do
    epoch_tm:reset()
    local counter = 0
-   local epoch_err_G = 0
-   local epoch_err_D = 0
    for i = 1, math.min(data:size(), opt.ntrain), opt.batchSize do
       tm:reset()
-      -- (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-      optim.adam(fDx, parametersD, optimStateD)
 
-      -- (2) Update G network: maximize log(D(G(z)))
-      optim.adam(fGx, parametersG, optimStateG)
+      iter_num = iter_num+1
+      
+      errG = 0
+      errD = 0
+     if opt.trainType == 1 then
+        if last_acc < 0.8 then
+          optim.adam(fDx, parametersD, optimStateD)
+          dCount = dCount+1
+        else
+          forwardD()
+          optim.adam(fGx, parametersG, optimStateG)
+          gCount = gCount+1
+          table.insert(loss_iter.netG, {iter_num, errG})
+        end
+        table.insert(loss_iter.netD, {iter_num, errD})
+     else
+        if last_acc < 0.8 then
+          optim.adam(fDx, parametersD, optimStateD)
+          optim.adam(fGx, parametersG, optimStateG)
+          dCount = dCount+1
+          gCount = gCount+1
+        else
+          forwardD()
+          optim.adam(fGx, parametersG, optimStateG)
+          gCount = gCount+1
+        end
+        table.insert(loss_iter.netD, {iter_num, errD})
+        table.insert(loss_iter.netG, {iter_num, errG})
+     end
+       trainIterLogger:add{
+        ['netG loss'] = errG,
+        ['netD loss'] = errD,
+      }
 
       -- display
       counter = counter + 1
@@ -231,35 +331,27 @@ for epoch = 1, opt.niter do
           local real = data:getBatch()
           disp.image(fake, {win=opt.display_id, title=opt.name})
           disp.image(real, {win=opt.display_id * 3, title=opt.name})
+
+          disp.plot(loss_iter.netD, {win=15,title = "errD"})
+          disp.plot(loss_iter.netG, {win=14,title = "errG"})
       end
 
       -- logging
       if ((i-1) / opt.batchSize) % 1 == 0 then
-         print(('Epoch: [%d][%8d / %8d]\t Time: %.3f  DataTime: %.3f  '
+         print(('Epoch: [%d][%d / %d](%d,%d)\t Time: %.3f  DataTime: %.3f  '
                    .. '  Err_G: %.4f  Err_D: %.4f'):format(
                  epoch, ((i-1) / opt.batchSize),
                  math.floor(math.min(data:size(), opt.ntrain) / opt.batchSize),
+                 dCount, gCount,
                  tm:time().real, data_tm:time().real,
-                 errG and errG or -1, errD and errD or -1))
-
-
+                 errG, errD))
       end
-
-      epoch_err_D = epoch_err_D + errD
-      epoch_err_G = epoch_err_G + errG
-
    end
-
-   trainEpochLogger:add{
-    ['Err_G'] = epoch_err_G/counter,
-    ['Err_D'] = epoch_err_D/counter,
-   }
-
-   paths.mkdir('checkpoints')
+   
    parametersD, gradParametersD = nil, nil -- nil them to avoid spiking memory
    parametersG, gradParametersG = nil, nil
-   --torch.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_G.t7', netG:clearState())
-   --torch.save('checkpoints/' .. opt.name .. '_' .. epoch .. '_net_D.t7', netD:clearState())
+   --torch.save(paths.concat(paths.resultPath, epoch .. '_net_G.t7'), netG:clearState())
+   --torch.save(paths.concat(paths.resultPath, epoch .. '_net_D.t7'), netD:clearState())
    parametersD, gradParametersD = netD:getParameters() -- reflatten the params and get them
    parametersG, gradParametersG = netG:getParameters()
    print(('End of epoch %d / %d \t Time Taken: %.3f'):format(
